@@ -2,14 +2,19 @@ import asyncio
 import openpyxl
 from playwright.async_api import async_playwright
 import os
+import sys
 
 async def main():
     print("Đang đọc proxy từ AmazonJP_test.xlsx...")
     proxy_str = None
+    row_idx = 2
+    if len(sys.argv) > 1 and sys.argv[1].isdigit():
+        row_idx = int(sys.argv[1])
+        
     try:
         wb = openpyxl.load_workbook("AmazonJP_test.xlsx")
         sheet = wb["Proxies"]
-        proxy_str = sheet.cell(row=2, column=1).value
+        proxy_str = sheet.cell(row=row_idx, column=1).value
         wb.close()
     except Exception as e:
         print(f"Không thể đọc file Excel: {e}")
@@ -50,7 +55,8 @@ async def main():
             "args": [
                 "--disable-blink-features=AutomationControlled",
                 "--disable-infobars",
-                "--no-sandbox"
+                "--no-sandbox",
+                "--lang=ja-JP"
             ]
         }
         if browser_path and "Chromium.app" in browser_path:

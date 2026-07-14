@@ -139,12 +139,19 @@ class AmazonRegisterApp(ctk.CTk):
         self.btn_browse_browser = ctk.CTkButton(self.config_frame, text="Chọn", width=60, command=self.browse_browser)
         self.btn_browse_browser.grid(row=0, column=3, padx=10, pady=5, sticky="w")
 
+        # Sheet chạy
+        self.target_sheet = ctk.StringVar(value="Outlooks")
+        self.lbl_target_sheet = ctk.CTkLabel(self.config_frame, text="Nguồn tài khoản:", font=ctk.CTkFont(weight="bold"))
+        self.lbl_target_sheet.grid(row=1, column=0, padx=10, pady=5, sticky="w")
+        self.opt_target_sheet = ctk.CTkOptionMenu(self.config_frame, variable=self.target_sheet, values=["Outlooks", "Gmails", "Iclouds"])
+        self.opt_target_sheet.grid(row=1, column=1, padx=10, pady=5, sticky="ew")
+
         # Số Worker
         self.lbl_workers = ctk.CTkLabel(self.config_frame, text="Số luồng (Workers): 1")
-        self.lbl_workers.grid(row=1, column=0, padx=10, pady=5, sticky="w")
+        self.lbl_workers.grid(row=2, column=0, padx=10, pady=5, sticky="w")
         self.slider_workers = ctk.CTkSlider(self.config_frame, from_=1, to=5, number_of_steps=4, command=self.update_worker_label)
         self.slider_workers.set(1)
-        self.slider_workers.grid(row=1, column=1, padx=10, pady=5, sticky="ew")
+        self.slider_workers.grid(row=2, column=1, padx=10, pady=5, sticky="ew")
         
         # Giới hạn Account
         self.lbl_limit = ctk.CTkLabel(self.config_frame, text="Số Acc cần chạy:")
@@ -154,23 +161,23 @@ class AmazonRegisterApp(ctk.CTk):
         
         # Checkbox Chạy ngầm, Proxy & Debug
         self.chk_headless = ctk.CTkCheckBox(self.config_frame, text="Chạy ngầm (Headless)")
-        self.chk_headless.grid(row=2, column=0, padx=10, pady=10, sticky="w")
+        self.chk_headless.grid(row=3, column=0, padx=10, pady=10, sticky="w")
         
         self.chk_proxy = ctk.CTkCheckBox(self.config_frame, text="Sử dụng Proxy")
-        self.chk_proxy.grid(row=2, column=1, padx=10, pady=10, sticky="w")
+        self.chk_proxy.grid(row=3, column=1, padx=10, pady=10, sticky="w")
         
         self.chk_debug = ctk.CTkCheckBox(self.config_frame, text="Chế độ Debug (Lưu ảnh lỗi)")
-        self.chk_debug.grid(row=2, column=2, columnspan=2, padx=10, pady=10, sticky="w")
+        self.chk_debug.grid(row=3, column=2, columnspan=2, padx=10, pady=10, sticky="w")
         
         # --- FRAME 3: ĐIỀU KHIỂN & TIẾN TRÌNH ---
         self.control_frame = ctk.CTkFrame(self)
         self.control_frame.grid(row=2, column=0, padx=15, pady=5, sticky="ew")
         self.control_frame.grid_columnconfigure(2, weight=1)
         
-        self.btn_start = ctk.CTkButton(self.control_frame, text="BẮT ĐẦU CHẠY", fg_color="#10b981", hover_color="#059669", font=ctk.CTkFont(weight="bold"), command=self.start_bot)
+        self.btn_start = ctk.CTkButton(self.control_frame, text="BẮT ĐẦU CHẠY", fg_color="#10b981", hover_color="#059669", font=ctk.CTkFont(weight="bold"), command=self.btn_start_click)
         self.btn_start.grid(row=0, column=0, padx=15, pady=15, ipadx=10, ipady=5)
         
-        self.btn_stop = ctk.CTkButton(self.control_frame, text="DỪNG LẠI", fg_color="#ef4444", hover_color="#dc2626", font=ctk.CTkFont(weight="bold"), state="disabled", command=self.stop_bot)
+        self.btn_stop = ctk.CTkButton(self.control_frame, text="DỪNG LẠI", fg_color="#ef4444", hover_color="#dc2626", font=ctk.CTkFont(weight="bold"), state="disabled", command=self.btn_stop_click)
         self.btn_stop.grid(row=0, column=1, padx=15, pady=15, ipadx=10, ipady=5)
         
         # Tiến trình và thống kê
@@ -337,63 +344,137 @@ class AmazonRegisterApp(ctk.CTk):
         self.coordinator_thread.daemon = True
         self.coordinator_thread.start()
         
-    def stop_bot(self):
+    def btn_start_click(self):
+        if self.is_running:
+            return
+            
+        import config
+        config.GLOBAL_STOP = False
+        
+        excel_path_val = self.excel_path.get().strip()
+        if not excel_path_val or not os.path.exists(excel_path_val):
+            messagebox.showerror("Lỗi", "Vui lòng chọn file Excel hợp lệ!")
+            return
+            
+        self.btn_start.configure(state="disabled")
+        self.btn_stop.configure(state="normal")
+        self.btn_browse.configure(state="disabled")
+        self.slider_workers.configure(state="disabled")
+        self.entry_limit.configure(state="disabled")
+        self.chk_headless.configure(state="disabled")
+        self.chk_proxy.configure(state="disabled")
+        self.chk_debug.configure(state="disabled")
+        
+        self.accounts_processed = 0
+        self.accounts_success = 0
+        self.accounts_failed = 0
+        
+        self.write_log("Đang phân tích dữ liệu Excel...")
+        
+        try:
+            limit_val = int(self.entry_limit.get().strip())
+        except ValueError:
+            limit_val = None
+            
+        use_proxy = self.chk_proxy.get() == 1
+        headless = self.chk_headless.get() == 1
+        debug_mode = self.chk_debug.get() == 1
+        
+        success = self.load_pending_accounts_to_queue(excel_path_val, use_proxy, limit_val)
+        if not success:
+            self.reset_gui_after_run()
+            return
+            
+        self.is_running = True
+        self.update_stats_label()
+        
+        num_workers = int(self.slider_workers.get())
+        
+        # Tạo lại status worker labels
+        for widget in self.status_frame.winfo_children():
+            widget.destroy()
+            
+        self.worker_labels = {}
+        for w_id in range(1, num_workers + 1):
+            lbl = ctk.CTkLabel(self.status_frame, text=f"Worker {w_id}: Chờ chạy...", anchor="w")
+            lbl.pack(fill="x", padx=5, pady=2)
+            self.worker_labels[w_id] = lbl
+            
+        self.cached_excel_path = self.excel_path.get()
+            
+        browser_path_val = self.browser_path.get().strip()
+        self.coordinator_thread = threading.Thread(target=self.run_coordinator, args=(num_workers, headless, debug_mode, browser_path_val))
+        self.coordinator_thread.daemon = True
+        self.coordinator_thread.start()
+        
+    def btn_stop_click(self):
         if not self.is_running:
             return
+            
+        import config
+        config.GLOBAL_STOP = True
         self.is_running = False
-        self.write_log("Đang gửi lệnh dừng tới các worker. Vui lòng đợi các luồng kết thúc...")
+        self.write_log("Đang yêu cầu dừng các luồng... Vui lòng chờ!")
         self.btn_stop.configure(state="disabled")
         
     def load_pending_accounts_to_queue(self, excel_path, use_proxy, limit):
         """Đọc file Excel và đưa các account 'pending' vào hàng đợi."""
         try:
             wb = openpyxl.load_workbook(excel_path)
-            
-            # Đọc Emails
-            emails_sheet = wb['Emails']
-            email_info_dict = {}
-            for r_idx in range(2, emails_sheet.max_row + 1):
-                raw_cell = emails_sheet.cell(row=r_idx, column=1).value
-                email_status = emails_sheet.cell(row=r_idx, column=2).value
-                if raw_cell:
-                    parts = raw_cell.split("|")
-                    if len(parts) >= 2:
-                        email_addr = parts[0].strip()
-                        email_pass = parts[1].strip()
-                        refresh_token = parts[2].strip() if len(parts) >= 3 else ""
-                        client_id = parts[3].strip() if len(parts) >= 4 else ""
-                        email_info_dict[email_addr] = (email_pass, r_idx, email_status, refresh_token, client_id)
-                        
+            target_sheet_name = self.target_sheet.get()
+            if target_sheet_name not in wb.sheetnames:
+                self.write_log(f"CẢNH BÁO: Không tìm thấy sheet nguồn '{target_sheet_name}' trong file Excel!")
+                messagebox.showwarning("Lỗi Sheet", f"Không tìm thấy sheet '{target_sheet_name}'!")
+                return False
+                
             # Đọc Proxies
             if use_proxy:
-                proxies_sheet = wb['Proxies']
-                self.proxy_manager.load_from_excel(proxies_sheet)
+                if 'Proxies' in wb.sheetnames:
+                    proxies_sheet = wb['Proxies']
+                    self.proxy_manager.load_from_excel(proxies_sheet)
                 if len(self.proxy_manager.proxies_usage) == 0:
                     self.write_log("CẢNH BÁO: Bật chạy proxy nhưng sheet Proxies không có dữ liệu!")
                     
-            # Đọc Accounts
-            accounts_sheet = wb['Accounts']
+            # Đọc danh sách cần chạy từ sheet nguồn (Outlooks, Gmails, Iclouds)
+            source_sheet = wb[target_sheet_name]
             pending_tasks = []
             
-            for r_idx in range(2, accounts_sheet.max_row + 1):
-                stt = accounts_sheet.cell(row=r_idx, column=1).value
-                email_addr = accounts_sheet.cell(row=r_idx, column=2).value
-                status = accounts_sheet.cell(row=r_idx, column=5).value
+            for r_idx in range(2, source_sheet.max_row + 1):
+                email_addr = source_sheet.cell(row=r_idx, column=1).value
+                email_pass = source_sheet.cell(row=r_idx, column=2).value
+                otp_email = source_sheet.cell(row=r_idx, column=3).value
+                otp_pass = source_sheet.cell(row=r_idx, column=4).value
                 
-                # Nếu stt là None và email cũng None thì dừng duyệt dòng trống
-                if stt is None and email_addr is None:
+                # Xác định cột Status tuỳ theo sheet
+                if target_sheet_name == "Outlooks":
+                    status = source_sheet.cell(row=r_idx, column=2).value # Cột 2 lưu status của Outlooks
+                else:
+                    status = source_sheet.cell(row=r_idx, column=5).value # Cột 5 cho Gmails/Iclouds
+                
+                refresh_token = ""
+                client_id = ""
+                
+                # Check nếu Outlooks vẫn dùng định dạng gộp cũ email|pass|token|client_id thì tách ra
+                if email_addr and "|" in str(email_addr):
+                    parts = str(email_addr).split("|")
+                    if len(parts) >= 2:
+                        email_addr = parts[0].strip()
+                        # Đối với định dạng cũ, pass có thể nằm ở cột 2 hoặc trong chuỗi gộp
+                        email_pass = parts[1].strip()
+                        refresh_token = parts[2].strip() if len(parts) >= 3 else ""
+                        client_id = parts[3].strip() if len(parts) >= 4 else ""
+                        otp_email = None
+                        otp_pass = None
+
+                if not email_addr:
                     continue
                     
-                is_pending = not status or str(status).strip().lower() in ["pending", "none", ""]
-                if email_addr and is_pending:
-                    # Lấy mật khẩu hòm thư tương ứng
-                    if email_addr in email_info_dict:
-                        email_pass, email_row_idx, email_created, refresh_token, client_id = email_info_dict[email_addr]
-                        # Không gán proxy cố định nữa, để worker tự get_proxy lúc chạy
-                        assigned_proxy = None
-                        pending_tasks.append((r_idx, email_addr, email_pass, email_row_idx, assigned_proxy, refresh_token, client_id))
-                    else:
-                        self.write_log(f"Cảnh báo: Account {email_addr} ở sheet Accounts không có thông tin mật khẩu ở sheet Emails!")
+                # Chạy lại cả Email bị Fail và Pending
+                is_pending = not status or str(status).strip().lower() in ["pending", "none", "", "fail", "failed"]
+                if is_pending:
+                    assigned_proxy = None
+                    email_row_idx = r_idx
+                    pending_tasks.append((r_idx, str(email_addr).strip(), str(email_pass).strip() if email_pass else "", email_row_idx, assigned_proxy, refresh_token, client_id, str(otp_email).strip() if otp_email else None, str(otp_pass).strip() if otp_pass else None, target_sheet_name))
                         
             wb.close()
             
@@ -495,7 +576,7 @@ class AmazonRegisterApp(ctk.CTk):
             except queue.Empty:
                 break
                 
-            accounts_row_idx, email_addr, email_pass, email_row_idx, _, refresh_token, client_id = task
+            accounts_row_idx, email_addr, email_pass, email_row_idx, _, refresh_token, client_id, otp_email, otp_pass, target_sheet_name = task
             
             # Cấp phát proxy nếu cần
             proxy_str = None
@@ -526,7 +607,9 @@ class AmazonRegisterApp(ctk.CTk):
                         worker_log,
                         refresh_token=refresh_token,
                         client_id=client_id,
-                        custom_browser_path=browser_path_val
+                        custom_browser_path=browser_path_val,
+                        otp_email=otp_email,
+                        otp_pass=otp_pass
                     )
                 )
             except Exception as e:
@@ -539,25 +622,41 @@ class AmazonRegisterApp(ctk.CTk):
                 try:
                     wb = openpyxl.load_workbook(self.cached_excel_path)
                     
-                    # 1. Cập nhật sheet Accounts
+                    # 1. Thêm kết quả vào sheet Accounts (sheet kết quả chính)
                     acc_sheet = wb['Accounts']
-                    acc_sheet.cell(row=accounts_row_idx, column=3, value=registered_name if status == "SUCCESS" else None)
-                    acc_sheet.cell(row=accounts_row_idx, column=4, value=registered_pass if status == "SUCCESS" else None)
-                    acc_sheet.cell(row=accounts_row_idx, column=5, value=status)
-                    acc_sheet.cell(row=accounts_row_idx, column=6, value=phone)
-                    acc_sheet.cell(row=accounts_row_idx, column=7, value=proxy_str if proxy_str else "direct")
-                    acc_sheet.cell(row=accounts_row_idx, column=8, value=elapsed_time)
-                    acc_sheet.cell(row=accounts_row_idx, column=9, value=error_msg)
-                    acc_sheet.cell(row=accounts_row_idx, column=10, value=datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
                     
-                    # 2. Cập nhật sheet Emails
-                    emails_sheet = wb['Emails']
-                    if status == "SUCCESS":
-                        emails_sheet.cell(row=email_row_idx, column=2, value="SUCCESS")
+                    # Tìm xem email này đã tồn tại trong sheet Accounts chưa để ghi đè, nếu chưa thì append
+                    existing_row = None
+                    for r in range(2, acc_sheet.max_row + 1):
+                        if str(acc_sheet.cell(row=r, column=2).value).strip() == str(email_addr).strip():
+                            existing_row = r
+                            break
+                            
+                    if existing_row:
+                        target_row = existing_row
                     else:
-                        emails_sheet.cell(row=email_row_idx, column=2, value="FAIL")
+                        target_row = acc_sheet.max_row + 1
+                        acc_sheet.cell(row=target_row, column=1, value=target_row - 1) # STT
+                        acc_sheet.cell(row=target_row, column=2, value=email_addr) # Email
                         
-                    # 3. Cập nhật Usage Count của Proxy (Cột C)
+                    acc_sheet.cell(row=target_row, column=3, value=registered_name if status == "SUCCESS" else None)
+                    acc_sheet.cell(row=target_row, column=4, value=registered_pass if status == "SUCCESS" else None)
+                    acc_sheet.cell(row=target_row, column=5, value=status)
+                    acc_sheet.cell(row=target_row, column=6, value=phone)
+                    acc_sheet.cell(row=target_row, column=7, value=proxy_str if proxy_str else "direct")
+                    acc_sheet.cell(row=target_row, column=8, value=elapsed_time)
+                    acc_sheet.cell(row=target_row, column=9, value=error_msg)
+                    acc_sheet.cell(row=target_row, column=10, value=datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+                    
+                    # 2. Cập nhật trạng thái vào sheet nguồn (Outlooks/Gmails/Iclouds)
+                    if target_sheet_name in wb.sheetnames:
+                        source_sheet = wb[target_sheet_name]
+                        if target_sheet_name == "Outlooks":
+                            # Ghi status vào cột 2 (giống Emails cũ)
+                            source_sheet.cell(row=email_row_idx, column=2, value=status)
+                        else:
+                            # Ghi status vào cột 5 của Iclouds/Gmails
+                            source_sheet.cell(row=email_row_idx, column=5, value=status)
                     if status == "SUCCESS" and proxy_str:
                         proxies_sheet = wb['Proxies']
                         for r_idx in range(2, proxies_sheet.max_row + 1):
@@ -614,6 +713,7 @@ class AmazonRegisterApp(ctk.CTk):
         defaults = {
             "excel_path": "",
             "browser_path": "",
+            "target_sheet": "Outlooks",
             "workers": 1,
             "limit": "",
             "headless": False,
@@ -635,6 +735,7 @@ class AmazonRegisterApp(ctk.CTk):
         config = self.load_config()
         self.excel_path.set(config.get("excel_path", ""))
         self.browser_path.set(config.get("browser_path", ""))
+        self.target_sheet.set(config.get("target_sheet", "Outlooks"))
         self.slider_workers.set(config.get("workers", 1))
         self.update_worker_label(config.get("workers", 1))
         
@@ -659,17 +760,17 @@ class AmazonRegisterApp(ctk.CTk):
     def save_config(self):
         """Lưu cấu hình hiện tại của GUI vào file config.json."""
         # Giữ lại các cấu hình ngầm định không nằm trên GUI
-        old_config = self.load_config()
-        config = {
+        config = self.load_config()
+        config.update({
             "excel_path": self.excel_path.get(),
             "browser_path": self.browser_path.get(),
+            "target_sheet": self.target_sheet.get(),
             "workers": int(self.slider_workers.get()),
             "limit": self.entry_limit.get().strip(),
             "headless": self.chk_headless.get() == 1,
             "use_proxy": self.chk_proxy.get() == 1,
             "debug_mode": self.chk_debug.get() == 1,
-            "max_accounts_per_proxy": old_config.get("max_accounts_per_proxy", 2)
-        }
+        })
         try:
             with open(self.CONFIG_FILE, "w", encoding="utf-8") as f:
                 json.dump(config, f, indent=4, ensure_ascii=False)

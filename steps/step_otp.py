@@ -182,7 +182,7 @@ async def fetch_otp_from_email_web(page, email_addr, email_pass, log):
             pass
     return None
 
-async def execute(page, email_addr, email_pass, refresh_token, client_id, otp_callback, fetch_otp_from_email, log):
+async def execute(page, email_addr, email_pass, refresh_token, client_id, otp_callback, fetch_otp_from_email, log, otp_email=None, otp_pass=None):
     """Thực hiện lấy OTP (IMAP hoặc popup hoặc web cào) và điền OTP gửi đi."""
     selector = await detect(page)
     if not selector:
@@ -192,8 +192,13 @@ async def execute(page, email_addr, email_pass, refresh_token, client_id, otp_ca
     
     otp_code = None
     
+    # 0. Thử lấy bằng IMAP Gmail/iCloud
+    if otp_email and otp_pass:
+        from src.core.email_reader_imap import get_amazon_otp_imap
+        otp_code = get_amazon_otp_imap(email_addr, otp_email, otp_pass, log)
+        
     # 1. Thử lấy bằng API DongVanFB nếu có refresh_token
-    if refresh_token and client_id:
+    if not otp_code and refresh_token and client_id:
         otp_code = await fetch_otp_from_dongvanfb(email_addr, refresh_token, client_id, log)
         
     # 2. Thử lấy OTP tự động qua IMAP nếu DongVanFB không có hoặc không thành công

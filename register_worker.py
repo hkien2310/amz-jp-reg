@@ -160,7 +160,9 @@ async def register_amazon_account(
     pre_password=None,
     refresh_token="",
     client_id="",
-    custom_browser_path=""
+    custom_browser_path="",
+    otp_email=None,
+    otp_pass=None
 ):
     """
     Thực hiện quá trình đăng ký tài khoản trên Amazon JP bằng Playwright.
@@ -182,6 +184,7 @@ async def register_amazon_account(
     # 2. Tạo thông tin tài khoản tự sinh hoặc dùng thông tin truyền vào
     name = pre_name if pre_name else generate_random_name()
     password = pre_password if pre_password else generate_random_password()
+    phone = None
     log(f"Thông tin tài khoản -> Tên: {name} | Mật khẩu: {password}")
     
     start_time = time.time()
@@ -291,6 +294,11 @@ async def register_amazon_account(
             otp_submitted = False
             
             while attempt < max_attempts and not completed:
+                import config
+                if config.GLOBAL_STOP:
+                    log("Đã nhận lệnh Dừng từ UI. Thoát khỏi luồng đăng ký.")
+                    raise Exception("Đã nhận lệnh dừng (Stop)")
+
                 attempt += 1
                 await page.wait_for_timeout(2000)  # Chờ trang ổn định sau chuyển đổi
                 
@@ -322,7 +330,7 @@ async def register_amazon_account(
                     
                 otp_selector = await step_otp.detect(page)
                 if otp_selector:
-                    await step_otp.execute(page, email_addr, email_pass, refresh_token, client_id, otp_callback, fetch_otp_from_email, log)
+                    await step_otp.execute(page, email_addr, email_pass, refresh_token, client_id, otp_callback, fetch_otp_from_email, log, otp_email, otp_pass)
                     otp_submitted = True
                     continue
                     
@@ -339,7 +347,7 @@ async def register_amazon_account(
                 # E. Kiểm tra màn hình đòi Add Số Điện Thoại
                 import steps.step_phone_verify as step_phone_verify
                 if await step_phone_verify.detect(page):
-                    await step_phone_verify.execute(page, log)
+                    phone = await step_phone_verify.execute(page, log)
                     continue
                     
                 # F. Kiểm tra trang Xác minh thiết bị (Verifying your device - màn hình captcha/browser)

@@ -491,6 +491,10 @@ async def _solve_waf_grid(page, solver, canvas_el, worker_id: str) -> bool:
         dom_changed = False
 
         while time.time() < max_wait:
+            import config
+            if getattr(config, 'GLOBAL_STOP', False):
+                log.info("Nhận lệnh Stop từ UI, thoát captcha.")
+                return False
             current_hint = await _read_hint(page)
             if current_hint != hint_text:
                 log.warning(f"  ⚠️ Hint thay đổi ('{hint_text}' → '{current_hint}')")

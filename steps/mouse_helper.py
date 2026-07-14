@@ -40,7 +40,11 @@ async def human_mouse_move(page, end_x, end_y, steps=15):
 
 async def click_element(page, selector):
     """Hover tự nhiên và click"""
-    element = await page.query_selector(selector)
+    if isinstance(selector, str):
+        element = await page.query_selector(selector)
+    else:
+        element = selector
+        
     if not element:
         return False
         
@@ -60,11 +64,15 @@ async def click_element(page, selector):
 
 async def human_type(page, selector, text):
     """Gõ phím từng chữ với tốc độ ngẫu nhiên, mô phỏng lỗi vặt"""
-    element = await page.query_selector(selector)
+    if isinstance(selector, str):
+        element = await page.query_selector(selector)
+    else:
+        element = selector
+        
     if not element:
         return False
         
-    await click_element(page, selector)
+    await click_element(page, element)
     for char in text:
         # 2% tỉ lệ gõ sai xong xoá
         if random.random() < 0.02 and char.isalpha():
