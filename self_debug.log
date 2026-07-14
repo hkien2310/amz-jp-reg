@@ -1,0 +1,26 @@
+=== CHẠY CHẾ ĐỘ DEBUG (CÓ GIAO DIỆN BROWSER, KHÔNG PROXY) ===
+Đọc dữ liệu từ file Excel và đồng bộ...
+Chọn email: heulwenharveylouisa2719@hotmail.com tại dòng 77 (Status hiện tại: )
+⚠️ Không dùng proxy (IP trần)!
+Bắt đầu chạy cho email: heulwenharveylouisa2719@hotmail.com
+[Worker 1] Bắt đầu xử lý đăng ký cho heulwenharveylouisa2719@hotmail.com
+[Worker 1] Sử dụng trình duyệt: Chrome (/Applications/Google Chrome.app/Contents/MacOS/Google Chrome)
+[Worker 1] Thông tin tài khoản -> Tên: Barbara White | Mật khẩu: 7uQM^tUNxB8Z
+[Worker 1] Đang truy cập trang chủ Amazon JP...
+[Worker 1] Đang click vào nút Đăng nhập...
+[Worker 1] Đã tự động điền email đăng ký.
+[Worker 1] Phát hiện màn hình xác nhận tài khoản mới (Intent). Đang bấm Proceed...
+[Worker 1] Đang kiểm tra cảnh báo lỗi từ Amazon...
+[Worker 1] Đang điền thông tin form đăng ký (Tên và Mật khẩu)...
+[Worker 1] Phát hiện màn hình xác minh thiết bị (Verifying your device). Đang bấm Continue...
+[Worker 1] Phát hiện Captcha! Đang tiến hành giải mã tự động...
+[Worker 1] Amazon chặn đăng ký (Account creation failed / Unusual activity)
+[Worker 1] LỖI trong quá trình tự động hóa: Amazon chặn đăng ký (Unusual activity)
+[Worker 1] Chế độ Debug: Đã chụp ảnh màn hình lỗi lưu tại debug_screenshots/error_heulwenharveylouisa2719_1783914607.png
+
+=== KẾT QUẢ CHẠY ===
+Trạng thái: FAILED
+Họ tên đăng ký: Barbara White
+Mật khẩu: 7uQM^tUNxB8Z
+Lỗi (nếu có): Amazon chặn đăng ký (Unusual activity)
+Đã lưu kết quả thành công vào file Excel!

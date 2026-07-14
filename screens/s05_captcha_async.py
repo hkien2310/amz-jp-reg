@@ -1,0 +1,1116 @@
+
+import asyncio
+import random
+async def random_delay(a, b):
+    await asyncio.sleep(random.uniform(a, b))
+
+async def shot(*args, **kwargs):
+    pass
+"""
+screens/s05_captcha.py — Detect và giải captcha Amazon.
+
+Hỗ trợ:
+  - AWS WAF Grid Canvas 3x3
+  - Arkose / FunCaptcha
+  - reCAPTCHA v2
+  - Image captcha
+
+Export:
+    is_present(page) -> bool
+    solve(page, worker_id='') -> bool
+    check_and_solve(page, amazon_pass='', full_name='') -> bool
+"""
+import time
+
+import sys
+import logging
+log = logging.getLogger("s05_captcha")
+log.setLevel(logging.INFO)
+
+
+
+
+
+
+async def is_present(page) -> bool:
+    """Detect captcha trên trang hiện tại."""
+    try:
+        if (
+            await page.query_selector("#aacb-waf-box")
+            or await page.query_selector("#captcha-container canvas")
+            or await page.query_selector("#aacb-captcha-header")
+        ):
+            return True
+        if await page.query_selector("iframe[src*='recaptcha']"):
+            return True
+        if await page.query_selector("#auth-captcha-image"):
+            return True
+        if (
+            await page.query_selector("#cvf-arkose-container")
+            or await page.query_selector("[id*='arkose'][id*='container']")
+            or await page.query_selector("#aacb-arkose-container")
+        ):
+            log.info("Detected Arkose captcha container")
+            return True
+
+        iframes = await page.query_selector_all("iframe")
+        for idx, iframe in enumerate(iframes):
+            try:
+                src = await iframe.get_attribute("src") or ""
+                name = await iframe.get_attribute("name") or ""
+                id_attr = await iframe.get_attribute("id") or ""
+                src_l = src.lower()
+                name_l = name.lower()
+                id_l = id_attr.lower()
+                if (
+                    "arkose" in src_l
+                    or "funcaptcha" in src_l
+                    or "client-api" in src_l
+                    or "arkose" in name_l
+                    or "arkose" in id_l
+                ):
+                    return True
+            except Exception:
+                pass
+
+        for frame in page.frames:
+            url = frame.url.lower()
+            name = frame.name.lower()
+            if (
+                "arkose" in url
+                or "funcaptcha" in url
+                or "client-api" in url
+                or "arkose" in name
+            ):
+                return True
+    except Exception as e:
+        log.warning(f"Error checking captcha: {e}")
+    return False
+
+
+async def check_and_solve(page, amazon_pass: str = "", full_name: str = "") -> bool:
+    """Detect và giải captcha nếu có. Trả về True nếu ok, False nếu giải thất bại."""
+    try:
+        if is_present(page):
+            log.warning("🔒 Captcha detected!")
+            await random_delay(1.5, 3.0)
+            if not solve(page):
+                log.error("Failed to solve captcha")
+                return False
+            await random_delay(2.5, 4.0)
+        return True
+    except Exception as e:
+        err = str(e)
+        if (
+            "Execution context was destroyed" in err
+            or "Target page" in err
+            or "context or browser" in err
+        ):
+            log.warning(f"Error checking captcha (page navigating): {err[:60]}")
+            return True
+        log.error(f"Unexpected error in check_and_solve: {e}")
+        return True  # Safe default
+
+
+async def solve(page, worker_id: str = "") -> bool:
+    """Giải captcha qua 2Captcha (chỉ khi CAPTCHA_ENABLED=true)."""
+    if not config.CAPTCHA_ENABLED:
+        log.warning("Captcha detected nhưng CAPTCHA_ENABLED=false → skip")
+        return False
+
+    try:
+        from twocaptcha import TwoCaptcha
+        import config
+        solver = TwoCaptcha(config.TWOCAPTCHA_API_KEY, defaultTimeout=180, pollingInterval=3)
+
+        # ── DUMP HTML FOR DIAGNOSTICS ─────────────────────────────────────
+        try:
+            import os
+            diag_dir = config.DATA_DIR / "diagnostics"
+            os.makedirs(diag_dir, exist_ok=True)
+            html_content = await page.content()
+            with open(diag_dir / "captcha_page.html", "w", encoding="utf-8") as f:
+                f.write(html_content)
+            log.info(f"  [DIAGNOSTIC] Saved page HTML to {diag_dir}/captcha_page.html")
+            
+            iframe_details = []
+            for idx, iframe in enumerate(await page.query_selector_all("iframe")):
+                iframe_details.append(f"IFrame #{idx}:")
+                iframe_details.append(f"  src: {await iframe.get_attribute('src')}")
+                iframe_details.append(f"  id: {await iframe.get_attribute('id')}")
+                iframe_details.append(f"  name: {await iframe.get_attribute('name')}")
+                try:
+                    iframe_details.append(f"  outerHTML: {await iframe.evaluate('el => el.outerHTML')[:1000]}")
+                except Exception:
+                    pass
+            with open(diag_dir / "iframe_details.txt", "w", encoding="utf-8") as f:
+                f.write("\n".join(iframe_details))
+            log.info(f"  [DIAGNOSTIC] Saved iframe details to {diag_dir}/iframe_details.txt")
+
+            frame_details = []
+            for idx, frame in enumerate(page.frames):
+                frame_details.append(f"Frame #{idx}:")
+                frame_details.append(f"  url: {frame.url}")
+                frame_details.append(f"  name: {frame.name}")
+            with open(diag_dir / "frame_urls.txt", "w", encoding="utf-8") as f:
+                f.write("\n".join(frame_details))
+            log.info("  [DIAGNOSTIC] Saved frame URLs to data/diagnostics/frame_urls.txt")
+        except Exception as e_diag:
+            log.warning(f"Failed to dump diagnostics: {e_diag}")
+
+        # ── Chờ nạp Captcha Iframe (Tránh Race Condition) ──────────────────
+        log.info("  Chờ captcha iframe nạp...")
+        iframe_loaded = False
+        for _ in range(16):  # 16 * 0.5s = 8s
+            for frame in page.frames:
+                url = frame.url.lower()
+                if any(x in url for x in ["arkoselabs", "funcaptcha", "client-api"]):
+                    iframe_loaded = True
+                    break
+            if iframe_loaded:
+                break
+            
+            # Check element
+            if (
+                await page.query_selector("#cvf-aamation-challenge-iframe")
+                or await page.query_selector("iframe[id*='challenge']")
+                or await page.query_selector("iframe[class*='challenge']")
+            ):
+                await asyncio.sleep(0.5)
+            else:
+                await asyncio.sleep(0.5)
+
+        # ── 0. Click "Start Puzzle" nếu đang ở màn hình landing ───────────
+        clicked_start = False
+        for frame in page.frames:
+            try:
+                res = await frame.evaluate("""() => {
+                    var selectors = [
+                        'button[aria-label*="Start Puzzle" i]',
+                        'button[aria-label*="Verify" i]',
+                        'button[data-theme="home.verifyButton"]',
+                        'button.eZxMRy',
+                        'button.button',
+                        'input[type="submit"]',
+                        'input[type="button"]'
+                    ];
+                    for (var sel of selectors) {
+                        var elements = document.querySelectorAll(sel);
+                        for (var el of elements) {
+                            var txt = (el.textContent || el.value || el.ariaLabel || '').toLowerCase();
+                            if (txt.indexOf('start puzzle') !== -1 || txt.indexOf('startpuzzle') !== -1 || txt.indexOf('verify') !== -1 || el.getAttribute('data-theme') === 'home.verifyButton') {
+                                await el.click();
+                                return 'clicked:' + txt;
+                            }
+                        }
+                    }
+                    return 'not_found';
+                }""")
+                if res and res.startswith('clicked:'):
+                    log.info(f"  ✅ Clicked 'Start Puzzle' button inside frame ({res})")
+                    clicked_start = True
+                    break
+            except Exception:
+                pass
+        
+        if clicked_start:
+            await asyncio.sleep(3.5)  # Chờ 3.5 giây để câu đố thực tế kịp render
+
+        # ── 1. AWS WAF CAPTCHA (awswaf.com / aamation / gridcaptcha-v2) ─────────────
+        # Detect bằng: script từ *.captcha.awswaf.com HOẶC container #aacb-waf-box
+        _html_content = ""
+        try:
+            _html_content = await page.content()
+        except Exception:
+            pass
+        _is_aws_waf = (
+            "captcha.awswaf.com" in _html_content
+            or await page.query_selector("#aacb-waf-box") is not None
+            or await page.query_selector("#cvf-aamation-container") is not None
+            or "cvf_aamation_response_token" in _html_content
+        )
+        if _is_aws_waf:
+            log.info("Detected AWS WAF CAPTCHA (aamation/gridcaptcha-v2)")
+            if await _solve_aws_waf(page, solver, _html_content):
+                return True
+
+        # ── 2. AWS WAF Grid Captcha (canvas 3x3) — fallback nếu cách trên fail ───
+        canvas_el = (
+            await page.query_selector("#captcha-container canvas")
+            or await page.query_selector("canvas")
+        )
+        # Nếu không thấy canvas ở main page, thử tìm trong các frame
+        if not canvas_el:
+            for _f in page.frames:
+                try:
+                    _fc = await _f.query_selector("canvas")
+                    if _fc:
+                        canvas_el = _fc
+                        log.info(f"  Canvas found inside frame: {_f.url[:60]}")
+                        break
+                except Exception:
+                    pass
+
+        if canvas_el:
+            log.info("Detected WAF Grid Captcha (canvas 3x3) - Fallback")
+            return _solve_waf_grid(page, solver, canvas_el, worker_id)
+
+        # ── 3. Arkose / FunCaptcha ────────────────────────────────────────
+        if await _solve_arkose(page, solver):
+            return True
+
+        # ── 4. reCAPTCHA v2 ───────────────────────────────────────────────
+        recaptcha_frame = await page.query_selector("iframe[src*='recaptcha']")
+        if recaptcha_frame:
+            import re as _re3
+            src = await recaptcha_frame.get_attribute("src") or ""
+            match = _re3.search(r"k=([A-Za-z0-9_-]+)", src)
+            if match:
+                sitekey = match.group(1)
+                log.info(f"Solving reCAPTCHA v2 sitekey={sitekey[:30]}")
+                result = solver.recaptcha(sitekey=sitekey, url=page.url)
+                token = result["code"]
+                await page.evaluate(f"document.getElementById('g-recaptcha-response').value='{token}'")
+                log.info("reCAPTCHA solved")
+                return True
+
+        # ── 4. Image captcha ──────────────────────────────────────────────
+        img_el = await page.query_selector("#auth-captcha-image")
+        if img_el:
+            captcha_path = await shot("captcha_image.png")
+            await img_el.screenshot(path=captcha_path)
+            result = solver.normal(captcha_path)
+            captcha_input = await page.query_selector("#auth-captcha-guess")
+            if captcha_input:
+                await captcha_input.fill(result["code"])
+                log.info(f"Image captcha solved: {result['code']}")
+                return True
+
+        # ── 5. Arrow / Orbit puzzle captcha ─────────────────────────────────
+        # "Use the arrows to move the icon into the indicated orbit"
+        left_btn = (
+            await page.query_selector("button[aria-label*='left' i]") or
+            await page.query_selector("button[aria-label*='Left' i]") or
+            await page.query_selector(".a-button-left") or
+            await page.query_selector("[data-action*='left' i]")
+        )
+        right_btn = (
+            await page.query_selector("button[aria-label*='right' i]") or
+            await page.query_selector("button[aria-label*='Right' i]") or
+            await page.query_selector(".a-button-right") or
+            await page.query_selector("[data-action*='right' i]")
+        )
+        submit_btn = await page.query_selector("button:has-text('Submit')")
+        html_lower = ""
+        try:
+            html_lower = await page.content().lower()
+        except Exception:
+            pass
+
+        if submit_btn and (left_btn or right_btn or "arrows" in html_lower or "orbit" in html_lower):
+            log.info("Detected Arrow/Orbit puzzle captcha")
+            return _solve_arrow_puzzle(page, solver)
+
+        log.warning("solve: Không detect được loại captcha nào")
+        try:
+            from src.core.amazon_register import set_error
+            set_error("WAF: Không detect được loại captcha nào")
+        except Exception:
+            pass
+        return False
+
+    except Exception as e:
+        err_str = str(e)
+        if "Execution context was destroyed" in err_str or "navigation" in err_str:
+            log.info(f"Captcha solve triggered navigation: {err_str[:60]} → assuming solved.")
+            return True
+        log.error(f"Captcha solving failed: {e}")
+        try:
+            from src.core.amazon_register import set_error
+            set_error(f"Captcha: {err_str[:60]}")
+        except Exception:
+            pass
+        return False
+
+
+# ─── Private helpers ──────────────────────────────────────────────────────────
+
+async def _read_hint(page) -> str:
+    try:
+        em_el = await page.query_selector("#captcha-container em")
+        if em_el:
+            return await page.evaluate("el => el.parentElement.innerText", em_el).strip().replace("\n", " ")
+        hint_el = await page.query_selector("#aacb-captcha-header, #captcha-container div")
+        if hint_el:
+            return hint_el.inner_text().strip()[:120]
+    except Exception:
+        pass
+    return "Choose all the items"
+
+
+async def _solve_waf_grid(page, solver, canvas_el, worker_id: str) -> bool:
+    """Giải WAF Grid Captcha (canvas 3x3)."""
+    round_cnt = 0
+    max_rounds = 10
+    _last_hint = ""
+
+    while round_cnt < max_rounds:
+        _t_round = time.time()
+
+        # Đợi hint cập nhật (round 2+)
+        if round_cnt > 0 and _last_hint:
+            log.info("  Doi hint cap nhat...")
+            _hint_deadline = time.time() + 5.0
+            hint_text = _read_hint(page)
+            while hint_text == _last_hint and time.time() < _hint_deadline:
+                await asyncio.sleep(0.1)
+                hint_text = _read_hint(page)
+
+        # Đợi canvas xuất hiện
+        try:
+            await page.wait_for_selector("canvas", state="attached", timeout=10000)
+        except Exception:
+            pass
+        await asyncio.sleep(0.3)
+
+        # Re-query canvas (tránh stale reference)
+        canvas_el = await page.query_selector("#captcha-container canvas") or await page.query_selector("canvas")
+        if not canvas_el:
+            log.info("Canvas gone → WAF solved!")
+            return True
+
+        # Đợi canvas fully rendered
+        log.info(f"Round {round_cnt+1}: doi canvas fully render...")
+        _canvas_ready = False
+        for _wait_i in range(20):
+            try:
+                is_painted = await page.evaluate("""el => {
+                    try {
+                        var ctx = el.getContext('2d');
+                        var w = el.width, h = el.height;
+                        if (w === 0 || h === 0) return false;
+                        var samples = [
+                            ctx.getImageData(w/2, h/2, 1, 1).data,
+                            ctx.getImageData(w/4, h/4, 1, 1).data,
+                            ctx.getImageData(3*w/4, h/4, 1, 1).data,
+                        ];
+                        return samples.some(d => !(d[0]===255 && d[1]===255 && d[2]===255) && d[3] > 0);
+                    } catch(e) { return false; }
+                }""", canvas_el)
+                if is_painted:
+                    log.info(f"  Canvas fully rendered ({_wait_i}s)")
+                    _canvas_ready = True
+                    break
+            except Exception:
+                pass
+            await asyncio.sleep(1)
+
+        if not _canvas_ready:
+            log.warning("  Canvas chưa render sau 20s — chụp luôn")
+
+        hint_text = _read_hint(page)
+        _last_hint = hint_text
+        log.info(f"  Hint: '{hint_text}'")
+
+        # Scroll canvas vào giữa viewport
+        await page.evaluate("""el => {
+            el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
+        }""", canvas_el)
+        await asyncio.sleep(0.3)
+
+        _box_a = await canvas_el.bounding_box()
+        await asyncio.sleep(0.15)
+        _box_b = await canvas_el.bounding_box()
+        if _box_a and _box_b and abs(_box_a['y'] - _box_b['y']) > 1:
+            log.warning("  Canvas đang scroll, đợi thêm...")
+            await asyncio.sleep(0.5)
+            _box_b = await canvas_el.bounding_box()
+
+        canvas_el = await page.query_selector("#captcha-container canvas") or await page.query_selector("canvas")
+        if not canvas_el:
+            log.info("  Canvas gone trước khi chụp → solved!")
+            return True
+
+        captcha_path = await shot(f"waf_captcha_{worker_id}_{round_cnt}.png")
+        try:
+            await canvas_el.screenshot(path=captcha_path)
+        except Exception as _sce:
+            log.warning(f"  Screenshot lỗi ({_sce}) — re-query...")
+            await asyncio.sleep(0.5)
+            canvas_el = await page.query_selector("canvas")
+            if not canvas_el:
+                return True
+            await canvas_el.screenshot(path=captcha_path)
+
+        _log_box = await canvas_el.bounding_box() or _box_b
+        if _log_box:
+            log.info(f"  Canvas tại ({_log_box['x']:.0f},{_log_box['y']:.0f}) size {_log_box['width']:.0f}x{_log_box['height']:.0f}")
+        log.info("  Chụp xong → gửi 2Captcha...")
+
+        t_send = time.time()
+        method = solver.get_method(captcha_path)
+        params = {'recaptcha': 1, **method, 'hintText': hint_text, 'rows': 3, 'cols': 3}
+        try:
+            task_id = solver.send(**params)
+            log.info(f"  Sent to 2Captcha. Task ID: {task_id}")
+        except Exception as se:
+            log.error(f"  Gửi 2Captcha thất bại: {se}")
+            try:
+                from src.core.amazon_register import set_error
+                set_error(f"2Captcha: Gửi ảnh thất bại ({str(se)[:50]})")
+            except Exception:
+                pass
+            return False
+
+        from twocaptcha import NetworkException
+        timeout = 180
+        polling_interval = 3
+        max_wait = time.time() + timeout
+        code = ""
+        dom_changed = False
+
+        while time.time() < max_wait:
+            current_hint = _read_hint(page)
+            if current_hint != hint_text:
+                log.warning(f"  ⚠️ Hint thay đổi ('{hint_text}' → '{current_hint}')")
+                dom_changed = True
+                break
+            try:
+                res_code = solver.get_result(task_id)
+                code = str(res_code)
+                break
+            except NetworkException:
+                await asyncio.sleep(polling_interval)
+            except Exception as pe:
+                log.error(f"  Lỗi poll 2Captcha: {pe}")
+                await asyncio.sleep(polling_interval)
+
+        if dom_changed:
+            try:
+                solver.report(task_id, False)
+            except Exception:
+                pass
+            log.info("  Bỏ qua captcha cũ, thử lại...")
+            await asyncio.sleep(0.5)
+            round_cnt += 1
+            continue
+
+        if not code:
+            log.error("  2Captcha timeout!")
+            try:
+                from src.core.amazon_register import set_error
+                set_error("2Captcha: Timeout chờ kết quả giải")
+            except Exception:
+                pass
+            return False
+
+        log.info(f"  2Captcha result ({time.time()-t_send:.1f}s): {code}")
+
+        import re as _re
+        click_indices = [int(x) for x in _re.findall(r"\d+", code.replace("click:", ""))]
+        click_indices = [i for i in click_indices if 1 <= i <= 9]
+        log.info(f"  Click ô: {click_indices}")
+
+        final_hint = _read_hint(page)
+        if final_hint != hint_text:
+            log.warning(f"  ⚠️ Hint thay đổi trước khi click")
+            try:
+                solver.report(task_id, False)
+            except Exception:
+                pass
+            await asyncio.sleep(0.5)
+            round_cnt += 1
+            continue
+
+        canvas_el = await page.query_selector("#captcha-container canvas") or await page.query_selector("canvas")
+        if not canvas_el:
+            log.info("  Canvas gone sau khi nhận kết quả → solved!")
+            return True
+
+        _click_box = await canvas_el.bounding_box()
+        if not _click_box:
+            log.error("  Không lấy được bounding_box!")
+            return False
+
+        _cw = _click_box['width']
+        _ch = _click_box['height']
+        _cx = _click_box['x']
+        _cy = _click_box['y']
+        log.info(f"  Click ref: ({_cx:.0f},{_cy:.0f}) size {_cw:.0f}x{_ch:.0f}")
+
+        for idx in click_indices:
+            try:
+                col = (idx - 1) % 3
+                row = (idx - 1) // 3
+                abs_x = _cx + (col + 0.5) * _cw / 3.0
+                abs_y = _cy + (row + 0.5) * _ch / 3.0
+                log.info(f"  Click ô {idx} (r{row+1}c{col+1}) → ({abs_x:.0f},{abs_y:.0f})")
+                page.mouse.move(abs_x, abs_y)
+                await asyncio.sleep(0.05)
+                page.mouse.down()
+                await asyncio.sleep(0.05)
+                page.mouse.up()
+                await asyncio.sleep(0.1)
+            except Exception as ce:
+                log.warning(f"  Click ô {idx} lỗi: {ce}")
+
+        confirm_btn = (
+            await page.query_selector("#amzn-btn-verify-internal")
+            or await page.query_selector("button:has-text('Confirm')")
+            or await page.query_selector("button[type='submit']")
+        )
+        if confirm_btn:
+            await confirm_btn.click()
+            log.info("  Confirmed!")
+        else:
+            log.warning("  Không tìm thấy Confirm button!")
+
+        try:
+            if not await page.query_selector("canvas"):
+                log.info(f"  WAF solved after round {round_cnt+1}!")
+                return True
+        except Exception as ce:
+            err_str = str(ce)
+            if "Execution context was destroyed" in err_str or "navigation" in err_str:
+                log.info(f"  WAF solved triggered navigation: {err_str[:60]}!")
+                return True
+            raise
+
+        round_cnt += 1
+
+    log.error("WAF: vượt max rounds")
+    try:
+        from src.core.amazon_register import set_error
+        set_error("WAF: Giải sai vượt quá 10 vòng")
+    except Exception:
+        pass
+    return False
+
+
+async def _solve_arrow_puzzle(page, solver) -> bool:
+    """
+    Giải Amazon Arrow/Orbit puzzle captcha.
+
+    Flow:
+        1. Chụp ảnh toàn bộ puzzle card
+        2. Gửi lên 2Captcha với instructions rõ ràng
+        3. Parse kết quả ("left" / "right" + số lần click)
+        4. Click arrow button tương ứng N lần
+        5. Click Submit
+    """
+    import re as _re
+    import time
+
+    max_rounds = 5
+    for attempt in range(max_rounds):
+        try:
+            # Đợi puzzle load xong
+            await asyncio.sleep(1.5)
+
+            # Chụp ảnh puzzle card
+            puzzle_card = (
+                await page.query_selector(".a-box-inner") or
+                await page.query_selector("[class*='puzzle']") or
+                await page.query_selector("[class*='captcha']") or
+                await page.query_selector("form")
+            )
+            captcha_path = await shot(f"arrow_puzzle_{attempt}.png")
+            if puzzle_card:
+                await puzzle_card.screenshot(path=captcha_path)
+            else:
+                await page.screenshot(path=captcha_path)
+            log.info(f"  Chụp arrow puzzle (attempt {attempt+1}) → gửi 2Captcha...")
+
+            # Gửi 2Captcha với hướng dẫn cụ thể
+            instruction = (
+                "This is an Amazon arrow/orbit puzzle. "
+                "The left image shows the TARGET position. "
+                "The right image shows the CURRENT state with left/right arrow buttons. "
+                "Determine: should I press LEFT or RIGHT arrow, and how many times? "
+                "Reply ONLY in format: 'left:N' or 'right:N' (e.g. 'left:3' or 'right:1'). "
+                "If already at target reply 'submit'."
+            )
+            result = solver.normal(
+                captcha_path,
+                textinstructions=instruction,
+            )
+            raw = (result.get("code") or "").strip().lower()
+            log.info(f"  2Captcha arrow result: '{raw}'")
+
+            if raw == "submit" or raw == "0":
+                # Đã ở đúng vị trí, submit luôn
+                pass
+            else:
+                # Parse "left:N" hoặc "right:N"
+                m = _re.search(r"(left|right)[:\s]*(\d+)", raw)
+                if m:
+                    direction = m.group(1)   # "left" hoặc "right"
+                    clicks    = int(m.group(2))
+                    log.info(f"  → Click '{direction}' {clicks} lần")
+
+                    # Tìm arrow buttons
+                    if direction == "left":
+                        arrow_btn = (
+                            await page.query_selector("button[aria-label*='left' i]") or
+                            await page.query_selector(".a-button-left") or
+                            await page.query_selector("[data-action*='left' i]") or
+                            await page.query_selector("button:has-text('←')")
+                        )
+                    else:
+                        arrow_btn = (
+                            await page.query_selector("button[aria-label*='right' i]") or
+                            await page.query_selector(".a-button-right") or
+                            await page.query_selector("[data-action*='right' i]") or
+                            await page.query_selector("button:has-text('→')")
+                        )
+
+                    if not arrow_btn:
+                        # Fallback: tìm theo text mũi tên unicode
+                        all_btns = await page.query_selector_all("button")
+                        for btn in all_btns:
+                            try:
+                                txt = btn.inner_text().strip()
+                                aria = (await btn.get_attribute("aria-label") or "").lower()
+                                if direction in aria or txt in ["←", "→", "<", ">"]:
+                                    arrow_btn = btn
+                                    break
+                            except Exception:
+                                pass
+
+                    if arrow_btn:
+                        for i in range(clicks):
+                            try:
+                                await arrow_btn.click()
+                                await asyncio.sleep(0.4)  # Đợi animation settle
+                                log.debug(f"    Click {direction} #{i+1}")
+                            except Exception as ce:
+                                log.warning(f"    Click lỗi tại #{i+1}: {ce}")
+                    else:
+                        log.warning(f"  Không tìm thấy '{direction}' arrow button!")
+
+                else:
+                    log.warning(f"  Không parse được kết quả: '{raw}'")
+
+            # Click Submit
+            await asyncio.sleep(0.5)
+            submit_btn = (
+                await page.query_selector("button:has-text('Submit')") or
+                await page.query_selector("input[type='submit']")
+            )
+            if submit_btn:
+                await submit_btn.click()
+                log.info("  ✅ Clicked Submit")
+                await asyncio.sleep(2)
+
+                # Check xem puzzle đã pass chưa (trang đã chuyển hay puzzle xuất hiện lại)
+                still_puzzle = (
+                    await page.query_selector("button:has-text('Submit')") or
+                    "arrows" in (await page.content().lower())
+                )
+                if not still_puzzle:
+                    log.info("  Arrow puzzle solved!")
+                    return True
+                else:
+                    log.warning(f"  Puzzle vẫn còn sau Submit (attempt {attempt+1}) — thử lại...")
+
+            else:
+                log.warning("  Không tìm thấy Submit button!")
+                return False
+
+        except Exception as e:
+            log.error(f"  Arrow puzzle attempt {attempt+1} lỗi: {e}")
+
+    log.error("Arrow puzzle: vượt max attempts")
+    return False
+
+
+async def _solve_arkose(page, solver) -> bool:
+    """Giải Arkose/FunCaptcha."""
+    arkose_src = None
+    for iframe in await page.query_selector_all("iframe"):
+        try:
+            src = (await iframe.get_attribute("src") or "").lower()
+            if any(x in src for x in ["arkoselabs", "funcaptcha", "client-api"]):
+                arkose_src = await iframe.get_attribute("src")
+                break
+        except Exception:
+            pass
+
+    if not arkose_src:
+        for frame in page.frames:
+            url = frame.url.lower()
+            if any(x in url for x in ["arkoselabs", "funcaptcha", "client-api"]):
+                arkose_src = frame.url
+                break
+
+    # Nếu không tìm thấy iframe nhưng có container hoặc pkey element thì vẫn tiếp tục
+    pkey_el = await page.query_selector("[data-pkey]") or await page.query_selector("#FunCaptcha")
+
+    if not arkose_src and not pkey_el:
+        return False
+
+    log.info("Detected Arkose/FunCaptcha")
+    sitekey = None
+    blob = None
+
+    if pkey_el:
+        sitekey = await pkey_el.get_attribute("data-pkey") or await pkey_el.get_attribute("data-public-key")
+        blob = await pkey_el.get_attribute("data-blob")
+
+    # 1. Thử extract pk, public_key, pkey, hay hash fragment từ src của iframe
+    if not sitekey and arkose_src:
+        import urllib.parse as _up
+        import re as _re
+        try:
+            parsed = _up.urlparse(arkose_src)
+            params = _up.parse_qs(parsed.query)
+            sitekey = params.get("pk", [None])[0] or params.get("pkey", [None])[0] or params.get("public_key", [None])[0]
+            if not sitekey and parsed.fragment:
+                # Có trường hợp public key nằm ở hash fragment của URL
+                sitekey = parsed.fragment.split("?")[0].split("&")[0]
+            if not sitekey and parsed.path:
+                # Có trường hợp public key nằm ở URL path: /56938EF5-6EFA-483E-B6F6-C8A72B6A95EE/index.html
+                m = _re.search(r'/([0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12})', parsed.path, _re.IGNORECASE)
+                if m:
+                    sitekey = m.group(1).upper()
+        except Exception:
+            pass
+
+    # Extract blob từ iframe URL query parameters
+    if not blob and arkose_src:
+        import urllib.parse as _up
+        try:
+            parsed = _up.urlparse(arkose_src)
+            params = _up.parse_qs(parsed.query)
+            blob = params.get("data", [None])[0]
+        except Exception:
+            pass
+
+    # 2. Thử evaluate window.ArkoseEnforcement hoặc inputs ẩn để tìm sitekey và blob
+    if not sitekey:
+        try:
+            sitekey = await page.evaluate("""() => {
+                if (window.ArkoseEnforcement && window.ArkoseEnforcement.publicKey)
+                    return window.ArkoseEnforcement.publicKey;
+                var el = document.querySelector('[data-pkey]');
+                if (el) return el.getAttribute('data-pkey');
+                return null;
+            }""")
+        except Exception:
+            pass
+
+    if not blob:
+        try:
+            blob = await page.evaluate("""() => {
+                if (window.ArkoseEnforcement && window.ArkoseEnforcement.config && window.ArkoseEnforcement.config.data) {
+                    return window.ArkoseEnforcement.config.data.blob;
+                }
+                var el = document.querySelector('input[name*="blob" i]') || document.querySelector('[data-blob]');
+                if (el) return el.getAttribute('value') || el.getAttribute('data-blob');
+                return null;
+            }""")
+        except Exception:
+            pass
+
+    # 3. Thử tìm regex trong code HTML của page
+    if not sitekey:
+        try:
+            import re as _re
+            html = await page.content()
+            # Arkose sitekeys are typically UUIDs (36 chars) or 16+ hex strings, not AWS WAF keys
+            m = _re.search(r'"(?:publicKey|sitekey|pk|data-external-id)"\s*:\s*"([0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12})"', html)
+            if m:
+                sitekey = m.group(1).upper()
+        except Exception:
+            pass
+
+    if not blob:
+        try:
+            import re as _re
+            html = await page.content()
+            m = _re.search(r'"blob"\s*:\s*"([^"]+)"', html)
+            if m:
+                blob = m.group(1)
+        except Exception:
+            pass
+
+    # 4. Fallback mặc định của Amazon
+    if not sitekey:
+        sitekey = "2F29FFB9-450F-44FA-8A71-9DE0CC817454"
+        log.info(f"Không extract được sitekey Arkose -> Dùng fallback mặc định của Amazon: {sitekey}")
+
+    # Trích xuất surl từ query parameters của iframe URL hoặc dùng fallback chuẩn
+    surl = "https://client-api.arkoselabs.com"
+    if arkose_src:
+        import urllib.parse as _up
+        try:
+            parsed = _up.urlparse(arkose_src)
+            params = _up.parse_qs(parsed.query)
+            query_surl = params.get("surl", [None])[0]
+            if query_surl:
+                surl = _up.unquote(query_surl)
+            elif "amazon" in arkose_src or "amazon" in page.url:
+                surl = "https://amazon-api.arkoselabs.com"
+        except Exception:
+            pass
+
+    log.info(f"Solving FunCaptcha sitekey={sitekey[:30]}... surl={surl}")
+
+    # Trích xuất User-Agent động để đảm bảo khớp phiên
+    ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+    try:
+        ua = await page.evaluate("() => navigator.userAgent")
+    except Exception:
+        pass
+
+    fc_kwargs = dict(
+        sitekey=sitekey,
+        url=page.url,
+        surl=surl,
+        userAgent=ua
+    )
+    # Thêm funcaptchaApiJSSubdomain — cần thiết để 2Captcha load đúng endpoint của Amazon
+    if surl:
+        import urllib.parse as _up2
+        fc_kwargs["funcaptchaApiJSSubdomain"] = _up2.urlparse(surl).hostname or surl
+
+    if blob:
+        import json as _json
+        log.info(f"Detected Arkose blob: {blob[:40]}...")
+        # 2Captcha yêu cầu blob dưới dạng JSON string: {"blob": "..."}
+        fc_kwargs["data"] = _json.dumps({"blob": blob})
+
+    result = solver.funcaptcha(**fc_kwargs)
+    token = result.get("code")
+    if not token:
+        log.error("FunCaptcha: 2Captcha không trả về token code")
+        return False
+
+    log.info(f"FunCaptcha token: {token[:40]}...")
+
+    # Inject token vào toàn bộ inputs và frames
+    for frame in page.frames:
+        try:
+            await frame.evaluate(f"""(function() {{
+                var token = '{token}';
+                ['FunCaptcha-Token','fc-token','arkose-token','arkoseToken'].forEach(function(name) {{
+                    document.querySelectorAll('[id="' + name + '"], [name="' + name + '"]').forEach(el => {{
+                        el.value = token;
+                        el.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                        el.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                    }});
+                }});
+                if (window.ArkoseEnforcement && window.ArkoseEnforcement.setConfig)
+                    window.ArkoseEnforcement.setConfig({{ mode: 'transparent' }});
+                
+                var payload = JSON.stringify({{
+                    eventId: 'challenge-complete',
+                    payload: {{ sessionToken: token }}
+                }});
+                window.postMessage(payload, '*');
+                if (window.parent) window.parent.postMessage(payload, '*');
+                if (window.top) window.top.postMessage(payload, '*');
+                
+                try {{ window.dispatchEvent(new CustomEvent('arkose-complete', {{ detail: {{ token: token }} }})); }} catch(e) {{}}
+            }})()""")
+        except Exception:
+            pass
+
+    log.info("Arkose token injected")
+    await random_delay(2, 3)
+
+    # Click submit button
+    submit_btn = (
+        await page.query_selector("#cvf-submit-otp-button")
+        or await page.query_selector("button[type='submit']")
+        or await page.query_selector("input[type='submit']")
+    )
+    if submit_btn:
+        try:
+            await submit_btn.click()
+            log.info("Clicked submit button after Arkose injection")
+        except Exception as se:
+            log.warning(f"Error clicking submit button after Arkose: {se}")
+
+    await random_delay(2, 3)
+    return True
+
+
+async def _solve_aws_waf(page, solver, html_content: str = "") -> bool:
+    """
+    Giải AWS WAF CAPTCHA (aamation / gridcaptcha-v2) của Amazon.
+
+    Flow:
+      1. Extract sitekey từ captcha.js URL (*.captcha.awswaf.com)
+      2. Extract iv + context từ wafInputProperties trong JS
+      3. Gọi 2Captcha AmazonTask (solver.amazon_waf)
+      4. Inject voucher → #cvf_aamation_response_token
+      5. Submit form cvf-aamation-challenge-form
+    """
+    import re as _re
+    import urllib.parse as _up
+
+    log.info("  [AWS WAF] Bắt đầu giải AWS WAF CAPTCHA...")
+
+    # Gom nội dung HTML từ main page và tất cả các iframe
+    full_html = html_content
+    for frame in page.frames:
+        try:
+            full_html += "\n" + await frame.content()
+        except Exception:
+            pass
+
+    # 1. Extract sitekey từ URL của captcha.js
+    # Pattern: https://ait.<sitekey>.us-east-1.captcha.awswaf.com/...
+    sitekey = None
+    waf_url = None
+    m_url = _re.search(
+        r'https://ait\.([a-f0-9]+)\.[^/]+\.captcha\.awswaf\.com[^\s"\'<>]*captcha\.js',
+        full_html
+    )
+    if m_url:
+        sitekey = m_url.group(1)
+        waf_url = m_url.group(0).split("?")[0]
+        log.info(f"  [AWS WAF] sitekey={sitekey} | url={waf_url[:60]}")
+
+    if not sitekey:
+        log.error("  [AWS WAF] Không extract được sitekey từ captcha.js URL!")
+        return False
+
+    # 2. Extract iv + context từ wafInputProperties
+    iv = None
+    context = None
+    # Tìm trong wafInputProperties object
+    # "id": "eyJ1bmlx..." là context/id
+    m_id = _re.search(r'"id"\s*:\s*"([A-Za-z0-9+/=]+)"', full_html)
+    if m_id:
+        context = m_id.group(1)
+        log.info(f"  [AWS WAF] context(id)={context[:30]}...")
+
+    # iv thường nằm trong script hoặc có thể không cần
+    m_iv = _re.search(r'"iv"\s*:\s*"([^"]+)"', full_html)
+    if m_iv:
+        iv = m_iv.group(1)
+        log.info(f"  [AWS WAF] iv={iv[:30]}...")
+
+    # 3. Gọi 2Captcha AmazonTask
+    log.info(f"  [AWS WAF] Gửi 2Captcha AmazonTask...")
+    try:
+        # Thử gọi qua method amazon_waf nếu có
+        kwargs = dict(
+            sitekey=sitekey,
+            url=page.url,
+            iv=iv or "",
+            context=context or ""
+        )
+
+        try:
+            result = solver.amazon_waf(**kwargs)
+        except AttributeError:
+            # Fallback: gọi trực tiếp qua API nếu SDK cũ chưa có method này
+            import requests as _req
+            payload = {
+                "key": config.TWOCAPTCHA_API_KEY,
+                "method": "amazon_waf",
+                "sitekey": sitekey,
+                "pageurl": page.url,
+                "json": 1,
+            }
+            if context:
+                payload["context"] = context
+            if iv:
+                payload["iv"] = iv
+            r = _req.post("https://2captcha.com/in.php", data=payload, timeout=30)
+            resp = r.json()
+            if resp.get("status") != 1:
+                log.error(f"  [AWS WAF] 2Captcha submit lỗi: {resp}")
+                return False
+                task_id = resp["request"]
+            log.info(f"  [AWS WAF] Task ID: {task_id} — đang poll...")
+            import time as _time
+            deadline = _time.time() + 180
+            voucher = None
+            while _time.time() < deadline:
+                await asyncio.sleep(5)
+                poll_resp = _req.get(
+                    f"https://2captcha.com/res.php?key={config.TWOCAPTCHA_API_KEY}&action=get&id={task_id}&json=1",
+                    timeout=15
+                ).json()
+                if poll_resp.get("status") == 1:
+                    voucher = poll_resp["request"]
+                    break
+                if poll_resp.get("request") not in ("CAPCHA_NOT_READY", "CAPTCHA_NOT_READY"):
+                    log.error(f"  [AWS WAF] Poll lỗi: {poll_resp}")
+                    return False
+            if not voucher:
+                log.error("  [AWS WAF] Timeout chờ 2Captcha!")
+                return False
+            result = {"code": voucher}
+
+        voucher = result.get("code") if isinstance(result, dict) else str(result)
+        if not voucher:
+            log.error("  [AWS WAF] 2Captcha không trả về voucher!")
+            return False
+
+        log.info(f"  [AWS WAF] Voucher nhận được: {voucher[:40]}...")
+
+    except Exception as e:
+        log.error(f"  [AWS WAF] 2Captcha gọi thất bại: {e}")
+        return False
+
+    # 4. Inject voucher vào input #cvf_aamation_response_token
+    injected = False
+    for frame in page.frames:
+        try:
+            done = await frame.evaluate(f"""(function() {{
+                var el = document.getElementById('cvf_aamation_response_token');
+                if (!el) el = document.querySelector('[name="cvf_aamation_response_token"]');
+                if (el) {{
+                    el.value = '{voucher}';
+                    el.dispatchEvent(new Event('change', {{bubbles:true}}));
+                    return true;
+                }}
+                return false;
+            }})()""")
+            if done:
+                log.info(f"  [AWS WAF] Voucher injected vào frame: {frame.url[:50]}")
+                injected = True
+                break
+        except Exception:
+            pass
+
+    if not injected:
+        log.warning("  [AWS WAF] Không inject được vào cvf_aamation_response_token — thử submit thẳng")
+
+    # 5. Submit form
+    await asyncio.sleep(1)
+    submitted = False
+    for frame in page.frames:
+        try:
+            done = await frame.evaluate("""(function() {
+                var form = document.getElementById('cvf-aamation-challenge-form');
+                if (form) { form.submit(); return true; }
+                return false;
+            })()""")
+            if done:
+                log.info("  [AWS WAF] ✅ Form submitted!")
+                submitted = True
+                break
+        except Exception:
+            pass
+
+    if not submitted:
+        # Fallback: click submit button
+        btn = (
+            await page.query_selector("#amzn-btn-verify-internal")
+            or await page.query_selector("button[type='submit']")
+            or await page.query_selector("input[type='submit']")
+        )
+        if btn:
+            await btn.click()
+            log.info("  [AWS WAF] ✅ Submit button clicked (fallback)")
+            submitted = True
+
+    await random_delay(3, 4)
+    return submitted
+
